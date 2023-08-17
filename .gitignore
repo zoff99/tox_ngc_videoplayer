@@ -1,0 +1,8 @@
+tox_ngc_videoplayer
+aa.mkv
+savedata.tox
+*.mp4
+*.mkv
+tox_ngc_videoplayer__*
+savedata.tox__BACKUP
+_ffmpeg_fix_.txt
