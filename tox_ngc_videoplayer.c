@@ -73,7 +73,7 @@
 #include <sodium/utils.h>
 
 // define this before including toxcore amalgamation -------
-#define MIN_LOGGER_LEVEL LOGGER_LEVEL_WARNING // LOGGER_LEVEL_DEBUG
+#define MIN_LOGGER_LEVEL LOGGER_LEVEL_WARNING // LOGGER_LEVEL_WARNING // LOGGER_LEVEL_DEBUG
 #define HW_CODEC_CONFIG_UTOX_UB81
 // #define HW_CODEC_CONFIG_TBW_LINNVENC
 #define HW_CODEC_CONFIG_HIGHVBITRATE
@@ -89,8 +89,8 @@
 // ----------- version -----------
 #define TOX_VPLAYER_VERSION_MAJOR 0
 #define TOX_VPLAYER_VERSION_MINOR 99
-#define TOX_VPLAYER_VERSION_PATCH 0
-static const char global_tox_vplayer_version_string[] = "0.99.0";
+#define TOX_VPLAYER_VERSION_PATCH 2
+static const char global_tox_vplayer_version_string[] = "0.99.2";
 
 // ----------- version -----------
 // ----------- version -----------
@@ -104,8 +104,8 @@ int max_video_bitrate_set = 0;
 #define DEFAULT_SCREEN_CAPTURE_FPS "30" // 30 fps desktop screen capture
 #define DEFAULT_SCREEN_CAPTURE_PULSE_DEVICE "default" // default pulse device is called "default"
 
-#define NGC_VIDEO_OUT_WIDTH 480
-#define NGC_VIDEO_OUT_HEIGHT 640
+#define NGC_VIDEO_OUT_WIDTH 640
+#define NGC_VIDEO_OUT_HEIGHT 480
 
 static int self_online = 0;
 static int friend_online = 0;
@@ -129,10 +129,12 @@ static ToxAV *toxav = NULL;
 static const int global_friend_num = 0; // we always only use the first friend
 char *global_pulse_inputdevice_name = NULL;
 char *global_desktop_capture_fps = NULL;
+char* global_desktop_display_num_str = NULL;
 int global_osd_message_toggle = 0;
 int global_hdmifreq_toggle = 60;
 static bool main_loop_running;
 int need_free_global_pulse_inputdevice_name = 0;
+int need_free_global_desktop_display_num_str = 0;
 int need_free_global_desktop_capture_fps = 0;
 AVRational time_base_audio = (AVRational) {0, 0};
 AVRational time_base_video = (AVRational) {0, 0};
@@ -161,10 +163,17 @@ uint8_t *encoded_vframe = NULL;
 uint32_t encoded_frame_size_bytes = 0;
 void* tox_av_ngc_coders_global = NULL;
 uint64_t global_last_sent_video_frame = 0;
-int global_ngc_video_bitrate = 800;
-int global_ngc_video_max_quantizer = 43;
-int global_ngc_video_fps_delta_ms = 90; // 90ms =~ 11fps
-
+//
+#define NGC_VIDEO_QUANTIZER_HIGH 42  // "high" here means "high quality" and therfore low q value
+#define NGC_VIDEO_BITRATE_HIGH 300
+//
+#define NGC_VIDEO_QUANTIZER_LOW 51
+#define NGC_VIDEO_BITRATE_LOW 90
+//
+int global_ngc_video_bitrate = NGC_VIDEO_BITRATE_LOW;
+int global_ngc_video_max_quantizer = NGC_VIDEO_QUANTIZER_LOW;
+int global_ngc_video_fps_delta_ms = 40; // 40ms =~ 25fps
+int sws_scale_algo = SWS_SINC; // SWS_SINC SWS_LANCZOS
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -763,8 +772,8 @@ static void set_ngc_video_header(uint8_t *buf)
 | magic        |       6        |  0x667788113435                                    |
 | version      |       1        |  0x01                                              |
 | pkt id       |       1        |  0x21                                              |
-| video width  |       1        |  uint8_t always 480                                |
-| video height |       1        |  uint8_t always 640                                |
+| video width  |       1        |  uint8_t always 224                                |
+| video height |       1        |  uint8_t always 128                                |
 | video codec  |       1        |  uint8_t always 1  (1 -> H264)                     |
 */
 
@@ -794,8 +803,22 @@ static void set_ngc_video_header(uint8_t *buf)
     buf++;
 }
 
-static bool ngc_toxav_video_send_frame_age(ToxAV *av, uint32_t friend_number, uint16_t width, uint16_t height, const uint8_t *y,
-                            const uint8_t *u, const uint8_t *v, TOXAV_ERR_SEND_FRAME *error, int32_t age_ms)
+static void rotateYUV420Buffer(uint8_t* in, uint8_t* out, uint32_t in_w, uint32_t in_stride, uint32_t in_h)
+{
+    for (int i = 0; i < in_h; i++) {
+        for (int j = 0; j < in_w; j++) {
+            const int d = (j * in_h) + (in_h - i - 1);
+            const int s = (i * in_stride) + j;
+            out[d] = in[s];
+        }
+    }
+}
+
+static bool ngc_toxav_video_send_frame_age(ToxAV *av, uint32_t friend_number,
+                            uint16_t output_width, uint16_t output_height,
+                            const uint16_t y_stride, const uint16_t u_stride, const uint16_t v_stride, 
+                            const uint8_t *y, const uint8_t *u, const uint8_t *v,
+                            TOXAV_ERR_SEND_FRAME *error, int32_t age_ms)
 {
     // HINT: send only about ~X fps
     if ((global_last_sent_video_frame + global_ngc_video_fps_delta_ms) > current_time_monotonic_default2())
@@ -809,14 +832,31 @@ static bool ngc_toxav_video_send_frame_age(ToxAV *av, uint32_t friend_number, ui
         return true;
     }
 
+    int y_size = output_width * output_height;
+    int u_size = (output_width/2) * (output_height/2);
+    int v_size = (output_width/2) * (output_height/2);
+    uint8_t *y_buf_temp2 = malloc(y_size );
+    uint8_t *u_buf_temp2 = malloc(u_size);
+    uint8_t *v_buf_temp2 = malloc(v_size);
+    rotateYUV420Buffer(y, y_buf_temp2,
+        output_width, y_stride, output_height);
+    rotateYUV420Buffer(u, u_buf_temp2,
+        (output_width/2), u_stride, (output_height/2));
+    rotateYUV420Buffer(v, v_buf_temp2,
+        (output_width/2), v_stride, (output_height/2));
+
     uint8_t *encoded_vframe_data = encoded_vframe + 11; // HINT: ngc group video header is 11 bytes
     set_ngc_video_header(encoded_vframe);
     bool res_enc = toxav_ngc_video_encode(tox_av_ngc_coders_global,
                                       global_ngc_video_bitrate,
-                                      width, height,
-                                      y, u, v,
+                                      global_ngc_video_max_quantizer,
+                                      output_height, output_width,
+                                      y_buf_temp2, u_buf_temp2, v_buf_temp2,
                                       encoded_vframe_data, &encoded_frame_size_bytes);
-    printf("ngc_toxav_video_send_frame_age:encoded size=%d res=%d\n", encoded_frame_size_bytes, res_enc);
+    // printf("ngc_toxav_video_send_frame_age:encoded size=%d res=%d\n", encoded_frame_size_bytes, res_enc);
+    free(y_buf_temp2);
+    free(u_buf_temp2);
+    free(v_buf_temp2);
 
     Tox *tox_local = toxav_get_tox(av);
     if (!tox_local)
@@ -856,12 +896,14 @@ static void show_seek_forward()
     text_on_yuf_frame_xy_ptr(1, ((SEEK_YUV_HEIGHT / 2) - (font_height / 2) - 2),
         "SEEK >>", color_white, yuv_image, SEEK_YUV_WIDTH, SEEK_YUV_HEIGHT);
 
+/*
     bool ret2 = ngc_toxav_video_send_frame_age(toxav, global_friend_num,
                 SEEK_YUV_WIDTH, SEEK_YUV_HEIGHT,
                 yuv_image,
                 yuv_image + (SEEK_YUV_WIDTH * SEEK_YUV_HEIGHT),
                 yuv_image + (SEEK_YUV_WIDTH * SEEK_YUV_HEIGHT) + ((SEEK_YUV_WIDTH * SEEK_YUV_HEIGHT) / 4),
                 NULL, 0);
+*/
 
     // Free the memory allocated for the YUV image buffer
     free(yuv_image);
@@ -893,6 +935,7 @@ static void show_pause(int age_ms)
         "PAUSE||", color_white, yuv_image, PAUSE_YUV_WIDTH, PAUSE_YUV_HEIGHT);
 
     TOXAV_ERR_SEND_FRAME error2;
+/*
     bool ret2 = ngc_toxav_video_send_frame_age(toxav, global_friend_num,
                 PAUSE_YUV_WIDTH, PAUSE_YUV_HEIGHT,
                 yuv_image,
@@ -903,7 +946,7 @@ static void show_pause(int age_ms)
     {
         // fprintf(stderr, "show_pause:%d %d\n", (int)ret2, error2);
     }
-
+*/
     // Free the memory allocated for the YUV image buffer
     free(yuv_image);
 }
@@ -929,6 +972,7 @@ static void show_novideo_text(int age_ms)
         "NO VIDEO", color_white, yuv_image, NOVIDEO_YUV_WIDTH, NOVIDEO_YUV_HEIGHT);
 
     TOXAV_ERR_SEND_FRAME error2;
+/*
     bool ret2 = ngc_toxav_video_send_frame_age(toxav, global_friend_num,
                 NOVIDEO_YUV_WIDTH, NOVIDEO_YUV_HEIGHT,
                 yuv_image,
@@ -939,6 +983,7 @@ static void show_novideo_text(int age_ms)
     {
         fprintf(stderr, "show_novideo_text:%d %d\n", (int)ret2, error2);
     }
+*/
     free(yuv_image);
 }
 
@@ -957,12 +1002,14 @@ static void flush_video(int age_ms)
     for (int i = SEEK_YUV_WIDTH * SEEK_YUV_HEIGHT; i < SEEK_YUV_WIDTH * SEEK_YUV_HEIGHT * 3 / 2; i++) {
         yuv_image[i] = color_white;
     }
+/*
     bool ret2 = ngc_toxav_video_send_frame_age(toxav, global_friend_num,
                 SEEK_YUV_WIDTH, SEEK_YUV_HEIGHT,
                 yuv_image,
                 yuv_image + (SEEK_YUV_WIDTH * SEEK_YUV_HEIGHT),
                 yuv_image + (SEEK_YUV_WIDTH * SEEK_YUV_HEIGHT) + ((SEEK_YUV_WIDTH * SEEK_YUV_HEIGHT) / 4),
                 NULL, age_ms);
+*/
     free(yuv_image);
 }
 
@@ -1178,7 +1225,8 @@ static void *thread_v_send_bg_func(void *data)
 
             TOXAV_ERR_SEND_FRAME error2;
             bool ret2 = ngc_toxav_video_send_frame_age(toxav, global_friend_num,
-                        planes_stride[0], output_height,
+                        output_width, output_height,
+                        planes_stride[0], planes_stride[1], planes_stride[2],
                         dst_yuv_buffer[0], dst_yuv_buffer[1], dst_yuv_buffer[2],
                         &error2, frame_age_ms);
 
@@ -1188,7 +1236,8 @@ static void *thread_v_send_bg_func(void *data)
                 yieldcpu(1);
                 frame_age_ms++;
                 ret2 = ngc_toxav_video_send_frame_age(toxav, global_friend_num,
-                            planes_stride[0], output_height,
+                            output_width, output_height,
+                            planes_stride[0], planes_stride[1], planes_stride[2],
                             dst_yuv_buffer[0], dst_yuv_buffer[1], dst_yuv_buffer[2],
                             &error2, frame_age_ms);
                 if (error2 != TOXAV_ERR_SEND_FRAME_OK)
@@ -1303,8 +1352,14 @@ static void *ffmpeg_thread_video_func(void *data)
 
         AVInputFormat *ifmt = av_find_input_format("x11grab");
 
+        const int desktop_display_cap_str_len = 1000;
+        char desktop_display_cap_str[desktop_display_cap_str_len];
+        memset(desktop_display_cap_str, 0, desktop_display_cap_str_len);
+        snprintf(desktop_display_cap_str, desktop_display_cap_str_len, "%s+0,0", global_desktop_display_num_str);
+        fprintf(stderr, "Display capture_string: %s\n", desktop_display_cap_str);
+
         // example: grab at position 10,20 ":0.0+10,20"
-        if (avformat_open_input(&format_ctx, ":0.0+0,0", ifmt, &options) != 0)
+        if (avformat_open_input(&format_ctx, desktop_display_cap_str, ifmt, &options) != 0)
         {
             fprintf(stderr, "Could not open desktop as video input stream.\n");
             return NULL;
@@ -1403,7 +1458,7 @@ static void *ffmpeg_thread_video_func(void *data)
     // Create a scaler context to convert the video to YUV
     struct SwsContext *scaler_ctx = sws_getContext(video_codec_ctx->width, video_codec_ctx->height,
             video_codec_ctx->pix_fmt, output_width, output_height,
-            AV_PIX_FMT_YUV420P, SWS_LANCZOS, NULL, NULL, NULL);
+            AV_PIX_FMT_YUV420P, sws_scale_algo, NULL, NULL, NULL);
 
     if (scaler_ctx == NULL) {
         fprintf(stderr, "Error: could not create scaler context\n");
@@ -1691,9 +1746,11 @@ static void *ffmpeg_thread_video_func(void *data)
                                                 }
                                                 // fprintf(stderr, "frame age:%d\n", frame_age_ms);
                                             }
+
                                             TOXAV_ERR_SEND_FRAME error2;
                                             bool ret2 = ngc_toxav_video_send_frame_age(toxav, global_friend_num,
-                                                        planes_stride[0], output_height,
+                                                        output_width, output_height,
+                                                        planes_stride[0], planes_stride[1], planes_stride[2],
                                                         dst_yuv_buffer[0], dst_yuv_buffer[1], dst_yuv_buffer[2],
                                                         &error2, frame_age_ms);
 
@@ -1705,7 +1762,8 @@ static void *ffmpeg_thread_video_func(void *data)
                                                     yieldcpu(1);
                                                     frame_age_ms++;
                                                     ret2 = ngc_toxav_video_send_frame_age(toxav, global_friend_num,
-                                                                planes_stride[0], output_height,
+                                                                output_width, output_height,
+                                                                planes_stride[0], planes_stride[1], planes_stride[2],
                                                                 dst_yuv_buffer[0], dst_yuv_buffer[1], dst_yuv_buffer[2],
                                                                 &error2, frame_age_ms);
                                                     if (error2 == TOXAV_ERR_SEND_FRAME_OK)
@@ -2285,8 +2343,18 @@ static void *thread_key_func(void *data)
         }
         else if (ch == 'c')
         {
-            printf("KK:----- CALL  -----\n");
-            // toxav_call(toxav, 0, DEFAULT_GLOBAL_AUD_BITRATE, GLOBAL_VID_BITRATE_var, NULL);
+            /*
+            if (sws_scale_algo == SWS_SINC)
+            {
+                printf("KK:-----SCALE ALGO SWS_LANCZOS -----\n");
+                sws_scale_algo = SWS_LANCZOS;
+            }
+            else
+            {
+                printf("KK:-----SCALE ALGO SWS_SINC -----\n");
+                sws_scale_algo = SWS_SINC;
+            }
+            */
         }
         else if (ch == 'o')
         {
@@ -2347,9 +2415,18 @@ static void *thread_key_func(void *data)
         }
         else if (ch == 'h')
         {
-            printf("KK:-----HANG UP-----\n");
-            // toxav_call_control(toxav, 0, TOXAV_CALL_CONTROL_CANCEL, NULL);
-            // friend_in_call = 0;
+            if (global_ngc_video_max_quantizer == NGC_VIDEO_QUANTIZER_LOW)
+            {
+                printf("KK:-----QUALITY HI -----\n");
+                global_ngc_video_bitrate = NGC_VIDEO_BITRATE_HIGH;
+                global_ngc_video_max_quantizer = NGC_VIDEO_QUANTIZER_HIGH;
+            }
+            else
+            {
+                printf("KK:-----QUALITY LOW-----\n");
+                global_ngc_video_bitrate = NGC_VIDEO_BITRATE_LOW;
+                global_ngc_video_max_quantizer = NGC_VIDEO_QUANTIZER_LOW;
+            }
         }
         pthread_mutex_unlock(&time___mutex);
 
@@ -2467,7 +2544,7 @@ int main(int argc, char *argv[])
 
     char *input_file_arg_str = NULL;
     int opt;
-    const char     *short_opt = "hvTti:p:f:xrm:";
+    const char     *short_opt = "hvTti:d:p:f:xrm:";
     struct option   long_opt[] =
     {
         {"help",          no_argument,       NULL, 'h'},
@@ -2517,7 +2594,7 @@ int main(int argc, char *argv[])
                 printf("  -i,                                  input filename or \"desktop\" to screenshare\n");
                 printf("  -r,                                  automatically adjust video bitrate\n");
                 printf("  -m,                                  set max. video bitrate\n");
-                printf("  -b,                                  show progress bar\n");
+                printf("  -d,                                  which X11 display number for desktop capture\n");
                 printf("  -p,                                  on \"desktop\" use this as pulse input device\n");
                 printf("                                           otherwise \"default\" is used\n");
                 printf("  -f,                                  on \"desktop\" use this as capture FPS\n");
@@ -2551,6 +2628,16 @@ int main(int argc, char *argv[])
                 need_free_global_pulse_inputdevice_name = 1;
                 break;
 
+            case 'd':
+                global_desktop_display_num_str = strdup(optarg);
+                if (global_desktop_display_num_str == NULL)
+                {
+                    fprintf(stderr, "Error copying display device string\n");
+                    return (-3);
+                }
+                need_free_global_desktop_display_num_str = 1;
+                break;
+
             case ':':
             case '?':
                 fprintf(stderr, "Try `%s --help' for more information.\n", argv[0]);
@@ -2564,6 +2651,11 @@ int main(int argc, char *argv[])
     }
 
     printf("ToxNGCVideoplayer version: %s\n", global_tox_vplayer_version_string);
+
+    if (global_desktop_display_num_str == NULL)
+    {
+        global_desktop_display_num_str = ":0.0";
+    }
 
     if (input_file_arg_str == NULL)
     {
@@ -2865,6 +2957,23 @@ int main(int argc, char *argv[])
     pthread_mutex_destroy(&vscale___mutex);
     pthread_mutex_destroy(&vsend___mutex);
 
+    printf("Leaving group ...\n");
+    Tox_Err_Group_Leave err_leave;
+    tox_group_leave(tox, 0, "bye", strlen("bye"), &err_leave);
+    printf("Leaving group ... res=%d\n", err_leave);
+    tox_iterate(tox, NULL);
+    yieldcpu(2);
+    tox_group_leave(tox, 0, "bye", strlen("bye"), &err_leave);
+    printf("Leaving group ...\n");
+    tox_iterate(tox, NULL);
+    yieldcpu(2);
+    for (int i = 0; i<60; i++)
+    {
+        tox_iterate(tox, NULL);
+        yieldcpu(tox_iteration_interval(tox));
+    }
+    printf("Leaving group ... done\n");
+
     toxav_kill(toxav);
     printf("killed ToxAV\n");
 #ifndef TOX_HAVE_TOXUTIL
@@ -2883,6 +2992,11 @@ int main(int argc, char *argv[])
     if (need_free_global_pulse_inputdevice_name == 1)
     {
         free(global_pulse_inputdevice_name);
+    }
+
+    if (need_free_global_desktop_display_num_str == 1)
+    {
+        free(global_desktop_display_num_str);
     }
 
     toxav_ngc_video_kill(tox_av_ngc_coders_global);
