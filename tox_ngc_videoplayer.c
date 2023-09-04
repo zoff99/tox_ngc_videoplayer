@@ -98,6 +98,7 @@ static const char global_tox_vplayer_version_string[] = "0.99.2";
 #define DEFAULT_GLOBAL_AUD_BITRATE 128 // kbit/sec
 #define DEFAULT_GLOBAL_VID_BITRATE 8000 // kbit/sec
 int GLOBAL_VID_BITRATE_var = DEFAULT_GLOBAL_VID_BITRATE;
+const int audio_frame_size_ms = 120;
 int vbr = 0;
 int max_video_bitrate = 8000;
 int max_video_bitrate_set = 0;
@@ -106,6 +107,8 @@ int max_video_bitrate_set = 0;
 
 #define NGC_VIDEO_OUT_WIDTH 640
 #define NGC_VIDEO_OUT_HEIGHT 480
+
+#define ___MAX_GC_PACKET_CHUNK_SIZE 1372
 
 static int self_online = 0;
 static int friend_online = 0;
@@ -161,19 +164,24 @@ struct termios newt;
 
 uint8_t *encoded_vframe = NULL;
 uint32_t encoded_frame_size_bytes = 0;
-void* tox_av_ngc_coders_global = NULL;
+void* tox_av_ngc_vcoders_global = NULL;
+void* tox_av_ngc_acoders_global = NULL;
 uint64_t global_last_sent_video_frame = 0;
 //
-#define NGC_VIDEO_QUANTIZER_HIGH 42  // "high" here means "high quality" and therfore low q value
+#define NGC_VIDEO_QUANTIZER_HIGH 40  // "high" here means "high quality" and therfore low q value
 #define NGC_VIDEO_BITRATE_HIGH 300
 //
 #define NGC_VIDEO_QUANTIZER_LOW 51
-#define NGC_VIDEO_BITRATE_LOW 90
+#define NGC_VIDEO_BITRATE_LOW 95
 //
 int global_ngc_video_bitrate = NGC_VIDEO_BITRATE_LOW;
 int global_ngc_video_max_quantizer = NGC_VIDEO_QUANTIZER_LOW;
-int global_ngc_video_fps_delta_ms = 40; // 40ms =~ 25fps
+int global_ngc_video_fps_delta_ms = 40; // 40ms =~ 25fps     100ms =~ 10fps
 int sws_scale_algo = SWS_SINC; // SWS_SINC SWS_LANCZOS
+
+int global_ngc_audio_bitrate = 8000; // 8 kbit/s
+int global_ngc_audio_sampling_rate = 48000; // 48 kHz
+int global_ngc_audio_channel_count = 1; // mono
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -764,17 +772,17 @@ static void text_on_yuf_frame_xy_ptr(int start_x_pix, int start_y_pix, const cha
     }
 }
 
-static void set_ngc_video_header(uint8_t *buf)
+static void set_ngc_audio_header(uint8_t *buf)
 {
 /*
-| what         | Length in bytes| Contents                                           |
-|------        |--------        |------------------                                  |
-| magic        |       6        |  0x667788113435                                    |
-| version      |       1        |  0x01                                              |
-| pkt id       |       1        |  0x21                                              |
-| video width  |       1        |  uint8_t always 224                                |
-| video height |       1        |  uint8_t always 128                                |
-| video codec  |       1        |  uint8_t always 1  (1 -> H264)                     |
+| what          | Length in bytes| Contents                                           |
+|------         |--------        |------------------                                  |
+| magic         |       6        |  0x667788113435                                    |
+| version       |       1        |  0x01                                              |
+| pkt id        |       1        |  0x31                                              |
+| audio channels|       1        |  uint8_t always 1 (for MONO)                       |
+| sampling freq |       1        |  uint8_t always 48 (for 48kHz)                     |
+| data          |[1, 1363]       |  *uint8_t  bytes, zero not allowed!                |
 */
 
     *buf = 0x66;
@@ -791,6 +799,63 @@ static void set_ngc_video_header(uint8_t *buf)
     buf++;
     *buf = 0x01;
     buf++;
+    *buf = 0x31;
+    buf++;
+    *buf = 1;
+    buf++;
+    *buf = 48;
+    buf++;
+}
+
+#define CRC_POLYNOM 0x9c
+#define CRC_PRESET 0xFF
+static uint8_t crc_8(const uint8_t *buf, const uint32_t num_bytes)
+{
+    uint8_t crc = CRC_PRESET;
+    for(uint32_t i = 0; i < num_bytes; i++) {
+        crc ^= *buf;
+        buf++;
+        for(uint32_t j = 0; j < 8; j++) {
+            if(crc & 0x01) {
+                crc = (crc >> 1) ^ CRC_POLYNOM;
+            } else {
+                crc = (crc >> 1);
+            }
+        }
+    }
+    return crc;
+}
+
+static void set_ngc_video_header(uint8_t *buf, uint16_t seqnum, uint8_t chksum)
+{
+/*
+| what          | Length in bytes| Contents                                                            |
+|------         |--------        |------------------                                                   |
+| magic         |       6        |  0x667788113435                                                     |
+| version       |       1        |  0x02                                                               |
+| pkt id        |       1        |  0x21                                                               |
+| video width   |       1        |  uint8_t always 224 (8bit of 480)                                   |
+| video height  |       1        |  uint8_t always 128 (8bit of 640)                                   |
+| video codec   |       1        |  uint8_t always 1  (1 -> H264)                                      |
+| seq number    |       2        |  uint16_t video frame sequence number (rolls over) in little endian |
+| chksum        |       1        |  uint8_t 8 bit CRC checksum over data                               |
+| data          |[1, 36986]      |  *uint8_t  bytes, zero not allowed!                                 |
+*/
+
+    *buf = 0x66;
+    buf++;
+    *buf = 0x77;
+    buf++;
+    *buf = 0x88;
+    buf++;
+    *buf = 0x11;
+    buf++;
+    *buf = 0x34;
+    buf++;
+    *buf = 0x35;
+    buf++;
+    *buf = 0x02;
+    buf++;
     *buf = 0x21;
     buf++;
     // warning: unsigned conversion from ‘int’ to ‘uint8_t’ {aka ‘unsigned char’} changes value from ‘480’ to ‘224’
@@ -800,6 +865,15 @@ static void set_ngc_video_header(uint8_t *buf)
     *buf = 128; // 640; // LOL
     buf++;
     *buf = 0x01;
+    buf++;
+    // seq num
+    const uint8_t lowerByte = (uint8_t)(seqnum & 0xFF);
+    const uint8_t upperByte = (seqnum >> 8) & 0xFF;
+    *buf = lowerByte;
+    buf++;
+    *buf = upperByte;
+    buf++;
+    *buf = chksum;
     buf++;
 }
 
@@ -814,6 +888,48 @@ static void rotateYUV420Buffer(uint8_t* in, uint8_t* out, uint32_t in_w, uint32_
     }
 }
 
+static uint64_t tta;
+static bool ngc_toxav_audio_send_frame_age(ToxAV *av, uint32_t friend_number, const int16_t *pcm, size_t sample_count,
+                            uint8_t channels, uint32_t sampling_rate, TOXAV_ERR_SEND_FRAME *error, int32_t age_ms)
+{
+    Tox *tox_local = toxav_get_tox(av);
+    if (!tox_local)
+    {
+        return true;
+    }
+
+    uint8_t *encoded_frame_bytes = calloc(1, 6000);
+    if (encoded_frame_bytes) {
+        uint8_t *encoded_frame_bytes_data = encoded_frame_bytes + 10; // HINT: ngc group audio header is 10 bytes
+        set_ngc_audio_header(encoded_frame_bytes);
+
+        uint32_t encoded_frame_size_bytes = 0;
+        bool res = toxav_ngc_audio_encode(tox_av_ngc_acoders_global,
+                    pcm, sample_count, encoded_frame_bytes_data, &encoded_frame_size_bytes);
+        encoded_frame_size_bytes = encoded_frame_size_bytes + 10;
+
+        bool lossless = true;
+        if (encoded_frame_size_bytes <= ___MAX_GC_PACKET_CHUNK_SIZE) {
+            lossless = false;
+        }
+
+        Tox_Err_Group_Send_Custom_Packet err_send;
+        bool res_send = tox_group_send_custom_packet(tox_local, 0,
+                    lossless, encoded_frame_bytes,
+                    encoded_frame_size_bytes, &err_send);
+
+        const int delta_a = (int)(current_time_monotonic_default2() - tta);
+        //printf("ngc_toxav_audio_send_frame_age:delta=%d:encoded_frame_size_bytes=%d sample_count=%d L=%d\n",
+        //        delta_a, encoded_frame_size_bytes, (int)sample_count, (int)lossless);
+        tta = current_time_monotonic_default2();
+
+    }
+    free(encoded_frame_bytes);
+    return true;
+}
+
+static uint64_t ttv;
+static uint16_t video_seqnum = 0;
 static bool ngc_toxav_video_send_frame_age(ToxAV *av, uint32_t friend_number,
                             uint16_t output_width, uint16_t output_height,
                             const uint16_t y_stride, const uint16_t u_stride, const uint16_t v_stride, 
@@ -845,14 +961,17 @@ static bool ngc_toxav_video_send_frame_age(ToxAV *av, uint32_t friend_number,
     rotateYUV420Buffer(v, v_buf_temp2,
         (output_width/2), v_stride, (output_height/2));
 
-    uint8_t *encoded_vframe_data = encoded_vframe + 11; // HINT: ngc group video header is 11 bytes
-    set_ngc_video_header(encoded_vframe);
-    bool res_enc = toxav_ngc_video_encode(tox_av_ngc_coders_global,
+    uint8_t *encoded_vframe_data = encoded_vframe + 14; // HINT: ngc group video header is 14 bytes
+    bool res_enc = toxav_ngc_video_encode(tox_av_ngc_vcoders_global,
                                       global_ngc_video_bitrate,
                                       global_ngc_video_max_quantizer,
                                       output_height, output_width,
                                       y_buf_temp2, u_buf_temp2, v_buf_temp2,
                                       encoded_vframe_data, &encoded_frame_size_bytes);
+
+    uint8_t chskum_crc_8 = crc_8(encoded_vframe_data, encoded_frame_size_bytes);
+    set_ngc_video_header(encoded_vframe, video_seqnum, chskum_crc_8);
+
     // printf("ngc_toxav_video_send_frame_age:encoded size=%d res=%d\n", encoded_frame_size_bytes, res_enc);
     free(y_buf_temp2);
     free(u_buf_temp2);
@@ -864,9 +983,34 @@ static bool ngc_toxav_video_send_frame_age(ToxAV *av, uint32_t friend_number,
         return true;
     }
 
+    bool lossless = true;
+    if ((encoded_frame_size_bytes + 14) <= ___MAX_GC_PACKET_CHUNK_SIZE) {
+        lossless = false;
+    }
     Tox_Err_Group_Send_Custom_Packet err_send;
-    bool res_send = tox_group_send_custom_packet(tox_local, 0, true, encoded_vframe, encoded_frame_size_bytes, &err_send);
-    // printf("ngc_toxav_video_send_frame_age:res=%d\n", err_send);
+    bool res_send = tox_group_send_custom_packet(tox_local, 0, lossless, encoded_vframe, encoded_frame_size_bytes + 14, &err_send);
+    if (err_send != TOX_ERR_GROUP_SEND_CUSTOM_PACKET_OK)
+    {
+        int tries;
+        for(tries=0;tries<5;tries++) {
+            res_send = tox_group_send_custom_packet(tox_local, 0, lossless, encoded_vframe, encoded_frame_size_bytes + 14, &err_send);
+            if (err_send == TOX_ERR_GROUP_SEND_CUSTOM_PACKET_OK) {
+                break;
+            }
+        }
+        if (err_send != TOX_ERR_GROUP_SEND_CUSTOM_PACKET_OK) {
+            if (err_send != TOX_ERR_GROUP_SEND_CUSTOM_PACKET_GROUP_NOT_FOUND) {
+                printf("ngc_toxav_video_send_frame_age failed with errorcode: %d tries: %d\n", err_send, (tries + 1));
+            }
+        }
+    }
+
+    const int delta_v = (int)(current_time_monotonic_default2() - tta);
+    //printf("ngc_toxav_video_send_frame_age:delta=%d:encoded_frame_size_bytes=%d L=%d chksum=%d video_seqnum=%d\n",
+    //            delta_v, (encoded_frame_size_bytes + 14), (int)lossless,
+    //            chskum_crc_8, video_seqnum);
+    ttv = current_time_monotonic_default2();
+    video_seqnum++;
 
     return true;
 }
@@ -1508,6 +1652,13 @@ static void *ffmpeg_thread_video_func(void *data)
     }
     printf("stream duration: %ld length: %ld\n", video_duration, video_length);
 
+    int hours, minutes, seconds;
+    // Calculating hours, minutes, and seconds
+    seconds = (video_length / 1000) % 60;
+    minutes = (video_length / (1000 * 60)) % 60;
+    hours = (video_length / (1000 * 60 * 60)) % 24;
+    printf("length: %02d:%02d:%02d\n", hours, minutes, seconds);
+
     while ((ffmpeg_thread_video_stop != 1) && (main_loop_running))
     {
         video_av_starttime = av_gettime();
@@ -1840,10 +1991,10 @@ static void *ffmpeg_thread_audio_func(void *data)
     uint8_t **converted_samples = NULL;
     int ret;
     int desktop_mode = 0;
-    const int out_channels = 2; // keep in sync with `out_channel_layout`
-    const int out_channel_layout = AV_CH_LAYOUT_STEREO; // AV_CH_LAYOUT_MONO or AV_CH_LAYOUT_STEREO;
+    const int out_channels = 1; // keep in sync with `out_channel_layout`
+    const int out_channel_layout = AV_CH_LAYOUT_MONO; // AV_CH_LAYOUT_MONO or AV_CH_LAYOUT_STEREO;
     const int out_bytes_per_sample = 2; // 2 byte per PCM16 sample
-    const int out_samples = 60 * 48; // X ms @ 48000Hz
+    const int out_samples = audio_frame_size_ms * 48; // X ms @ 48000Hz
     const int out_sample_rate = 48000; // fixed at 48000Hz
     const int temp_audio_buf_sizes = 600000; // fixed buffer
     int audio_delay_in_bytes = 0;
@@ -2146,6 +2297,34 @@ static void *ffmpeg_thread_audio_func(void *data)
                                         // memset(buf, 0, temp_audio_buf_sizes);
                                         size_t read_bytes = fifo_buffer_read(audio_pcm_buffer, buf, out_samples * out_channels * out_bytes_per_sample);
                                         // printf("AA:read_bytes: %ld\n", read_bytes);
+                                        Toxav_Err_Send_Frame error3;
+                                        ngc_toxav_audio_send_frame_age(toxav, global_friend_num, (const int16_t *)buf, out_samples,
+                                                    out_channels, out_sample_rate, &error3, frame_age_ms);
+
+                                        if (error3 != TOXAV_ERR_SEND_FRAME_OK)
+                                        {
+                                            for (int retry=0;retry<5;retry++)
+                                            {
+                                                fprintf(stderr, "toxav_audio_send_frame:%d samples=%d channels=%d sr=%d -> retrying %d ...\n",
+                                                    error3, out_samples, out_channels, out_sample_rate, (retry + 1));
+                                                yieldcpu(1);
+                                                frame_age_ms++;
+                                                ngc_toxav_audio_send_frame_age(toxav, global_friend_num, (const int16_t *)buf, out_samples,
+                                                            out_channels, out_sample_rate, &error3, frame_age_ms);
+                                                if (error3 == TOXAV_ERR_SEND_FRAME_OK)
+                                                {
+                                                    break;
+                                                }
+                                            }
+
+                                            if (error3 != TOXAV_ERR_SEND_FRAME_OK)
+                                            {
+                                                fprintf(stderr, "toxav_audio_send_frame:%d samples=%d channels=%d sr=%d -> retrying -> FAILED\n",
+                                                    error3, out_samples, out_channels, out_sample_rate);
+                                            }
+                                        }
+
+
                                     }
                                 }
                             }
@@ -2667,8 +2846,11 @@ int main(int argc, char *argv[])
 
     encoded_vframe = calloc(1, 40000);
     encoded_frame_size_bytes = 0;
-    tox_av_ngc_coders_global = toxav_ngc_video_init(global_ngc_video_bitrate, global_ngc_video_max_quantizer);
+    tox_av_ngc_vcoders_global = toxav_ngc_video_init(global_ngc_video_bitrate, global_ngc_video_max_quantizer);
+    tox_av_ngc_acoders_global = toxav_ngc_audio_init(global_ngc_audio_bitrate,
+            global_ngc_audio_sampling_rate, global_ngc_audio_channel_count);
 
+    fprintf(stderr, "group coders: v=%p a=%p\n", tox_av_ngc_vcoders_global, tox_av_ngc_acoders_global);
 
 #if (LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(58,9,100))
     av_register_all();
@@ -2999,7 +3181,8 @@ int main(int argc, char *argv[])
         free(global_desktop_display_num_str);
     }
 
-    toxav_ngc_video_kill(tox_av_ngc_coders_global);
+    toxav_ngc_video_kill(tox_av_ngc_vcoders_global);
+    toxav_ngc_audio_kill(tox_av_ngc_acoders_global);
     free(encoded_vframe);
 
     restore_term();
