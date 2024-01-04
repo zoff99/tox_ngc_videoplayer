@@ -168,7 +168,7 @@ void* tox_av_ngc_vcoders_global = NULL;
 void* tox_av_ngc_acoders_global = NULL;
 uint64_t global_last_sent_video_frame = 0;
 //
-#define NGC_VIDEO_QUANTIZER_HIGH 40  // "high" here means "high quality" and therfore low q value
+#define NGC_VIDEO_QUANTIZER_HIGH 38 // 40  // "high" here means "high quality" and therfore low q value
 #define NGC_VIDEO_BITRATE_HIGH 300
 //
 #define NGC_VIDEO_QUANTIZER_LOW 51
@@ -176,10 +176,10 @@ uint64_t global_last_sent_video_frame = 0;
 //
 int global_ngc_video_bitrate = NGC_VIDEO_BITRATE_LOW;
 int global_ngc_video_max_quantizer = NGC_VIDEO_QUANTIZER_LOW;
-int global_ngc_video_fps_delta_ms = 40; // 40ms =~ 25fps     100ms =~ 10fps
+int global_ngc_video_fps_delta_ms = 50; // 40ms =~ 25fps     100ms =~ 10fps
 int sws_scale_algo = SWS_SINC; // SWS_SINC SWS_LANCZOS
 
-int global_ngc_audio_bitrate = 8000; // 8 kbit/s
+int global_ngc_audio_bitrate = 10000; // 10 kbit/s
 int global_ngc_audio_sampling_rate = 48000; // 48 kHz
 int global_ngc_audio_channel_count = 1; // mono
 
@@ -2998,9 +2998,6 @@ int main(int argc, char *argv[])
     // ----- bootstrap -----
     printf("Tox bootstrapping\n");
 
-    // dummy node to bootstrap
-    tox_bootstrap(tox, "local", 7766, (uint8_t *)"2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1", NULL);
-
     for (int i = 0; nodes1[i].ip; i++)
     {
         uint8_t *key = (uint8_t *)calloc(1, 100);
@@ -3010,10 +3007,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        if (use_tor == 0)
-        {
-            tox_bootstrap(tox, nodes1[i].ip, nodes1[i].udp_port, key, NULL);
-        }
+        tox_bootstrap(tox, nodes1[i].ip, nodes1[i].udp_port, key, NULL);
 
         if (nodes1[i].tcp_port != 0)
         {
