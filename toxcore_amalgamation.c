@@ -4211,6 +4211,8 @@ typedef struct GC_Chat {
 
     uint8_t     m_group_public_key[CRYPTO_PUBLIC_KEY_SIZE];  // public key for group's messenger friend connection
     int         friend_connection_id;  // identifier for group's messenger friend connection
+
+    bool        flag_exit;  // true if the group will be deleted after the next do_gc() iteration
 } GC_Chat;
 
 #ifndef MESSENGER_DEFINED
@@ -32792,6 +32794,11 @@ static int handle_gc_key_exchange(const GC_Chat *chat, GC_Connection *gconn, con
     memcpy(response + 1, new_session_pk, ENC_PUBLIC_KEY_SIZE);
 
     if (!send_lossless_group_packet(chat, gconn, response, sizeof(response), GP_KEY_ROTATION)) {
+        // Don't really care about zeroing the secret key here, because we failed, but
+        // we're doing it anyway for symmetry with the memzero+munlock below, where we
+        // really do care about it.
+        crypto_memzero(new_session_sk, sizeof(new_session_sk));
+        crypto_memunlock(new_session_sk, sizeof(new_session_sk));
         return -3;
     }
 
@@ -32801,6 +32808,7 @@ static int handle_gc_key_exchange(const GC_Chat *chat, GC_Connection *gconn, con
 
     gcc_make_session_shared_key(gconn, sender_public_session_key);
 
+    crypto_memzero(new_session_sk, sizeof(new_session_sk));
     crypto_memunlock(new_session_sk, sizeof(new_session_sk));
 
     gconn->last_key_rotation = mono_time_get(chat->mono_time);
@@ -36036,6 +36044,10 @@ void do_gc(GC_Session *c, void *userdata)
                 c->connection_status_change(c->messenger, chat->group_number, chat->connection_state, userdata);
             }
         }
+
+        if (chat->flag_exit) {  // should always come last as it modifies the chats array
+            group_delete(c, chat);
+        }
     }
 }
 
@@ -37024,7 +37036,14 @@ static void group_delete(GC_Session *c, GC_Chat *chat)
 
 int gc_group_exit(GC_Session *c, GC_Chat *chat, const uint8_t *message, uint16_t length)
 {
-    const int ret =  group_can_handle_packets(chat) ? send_gc_self_exit(chat, message, length) : 0;
+    chat->flag_exit = true;
+    return group_can_handle_packets(chat) ? send_gc_self_exit(chat, message, length) : 0;
+}
+
+non_null()
+static int kill_group(GC_Session *c, GC_Chat *chat)
+{
+    const int ret = gc_group_exit(c, chat, nullptr, 0);
     group_delete(c, chat);
     return ret;
 }
@@ -37042,11 +37061,9 @@ void kill_dht_groupchats(GC_Session *c)
             continue;
         }
 
-        if (group_can_handle_packets(chat)) {
-            send_gc_self_exit(chat, nullptr, 0);
+        if (kill_group(c, chat) != 0) {
+            LOGGER_WARNING(chat->log, "Failed to send group exit packet");
         }
-
-        group_cleanup(c, chat);
     }
 
     networking_registerhandler(c->messenger->net, NET_PACKET_GC_LOSSY, nullptr, nullptr);
@@ -49212,6 +49229,7 @@ Networking_Core *new_networking_ex(
      */
     int n = 1024 * 1024 * 2;
 
+#if !(defined(__NetBSD__))
     if (net_setsockopt(ns, temp->sock, SOL_SOCKET, SO_RCVBUF, &n, sizeof(n)) != 0) {
         LOGGER_ERROR(log, "failed to set socket option %d", SO_RCVBUF);
     }
@@ -49219,6 +49237,7 @@ Networking_Core *new_networking_ex(
     if (net_setsockopt(ns, temp->sock, SOL_SOCKET, SO_SNDBUF, &n, sizeof(n)) != 0) {
         LOGGER_ERROR(log, "failed to set socket option %d", SO_SNDBUF);
     }
+#endif
 
     /* Enable broadcast on socket */
     int broadcast = 1;
@@ -70842,6 +70861,7 @@ bool tox_is_data_encrypted(const uint8_t *data)
 
 
 
+extern bool global_do_not_sync_av;
 
 static struct TSBuffer *jbuf_new(int size);
 static void jbuf_free(struct TSBuffer *q);
@@ -71031,7 +71051,12 @@ static inline struct RTPMessage *jbuf_read(Logger *log, struct TSBuffer *q, int3
     uint32_t tsb_range_ms_used = tsb_range_ms;
     uint32_t timestamp_want_get_used = want_remote_video_ts;
 
-    if ((ac->audio_received_first_frame) == 0 || (video_has_rountrip_time_ms == 0)) {
+    if (
+        (global_do_not_sync_av) ||
+        (ac->audio_received_first_frame) == 0 ||
+        (video_has_rountrip_time_ms == 0)
+        )
+    {
         LOGGER_API_DEBUG(ac->tox, "AA:%d %d", (int)ac->audio_received_first_frame, (int)video_has_rountrip_time_ms);
         tsb_range_ms_used = UINT32_MAX;
         timestamp_want_get_used = UINT32_MAX;
